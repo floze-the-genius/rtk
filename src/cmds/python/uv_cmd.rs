@@ -1,9 +1,14 @@
 //! Filters `uv run` output while preserving uv-managed environment semantics.
+//!
+//! `uv run` executes arbitrary programs, so on success the child's stdout is the
+//! signal the caller asked for and is passed through; only uv's own chatter
+//! (stderr) is dropped. Collapsing a successful run to a summary would discard
+//! the program's result with no way to recover it.
 
 use crate::core::runner;
 use crate::core::stream::{self, FilterMode, StdinMode};
 use crate::core::tracking;
-use crate::core::truncate::CAP_WARNINGS;
+use crate::core::truncate::{CAP_INVENTORY, CAP_WARNINGS};
 use crate::core::utils::{exit_code_from_status, resolved_command, strip_ansi, truncate};
 use anyhow::{Context, Result};
 use lazy_static::lazy_static;
@@ -34,6 +39,7 @@ lazy_static! {
 const MAX_TRACEBACK_FRAMES: usize = CAP_WARNINGS;
 const MAX_ERROR_CONTINUATION_LINES: usize = CAP_WARNINGS;
 const MAX_FALLBACK_TAIL_LINES: usize = CAP_WARNINGS;
+const MAX_PROGRAM_OUTPUT_LINES: usize = CAP_INVENTORY;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
@@ -56,7 +62,12 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
     let result = stream::run_streaming(&mut cmd, StdinMode::Inherit, FilterMode::CaptureOnly)
         .context("Failed to run uv")?;
-    let filtered = filter_uv_run_output(&result.raw, result.exit_code);
+    let filtered = filter_uv_run_output(
+        &result.raw,
+        &result.raw_stdout,
+        &result.raw_stderr,
+        result.exit_code,
+    );
 
     runner::print_with_hint(&filtered, &result.raw, &result.raw, "uv", result.exit_code);
     timer.track(&original_cmd, &rtk_cmd, &result.raw, &filtered);
@@ -72,8 +83,47 @@ fn display_command(prefix: &str, args_display: &str) -> String {
     }
 }
 
-fn filter_uv_run_output(output: &str, exit_code: i32) -> String {
+fn filter_uv_run_output(output: &str, stdout: &str, stderr: &str, exit_code: i32) -> String {
+    if exit_code == 0 {
+        return filter_successful_run(stdout, stderr);
+    }
+
+    // On failure the streams are scanned merged: a Python traceback interleaves
+    // stdout and stderr, and splitting it would break frame ordering.
+    let extracted = extract_diagnostics(output);
+    if !extracted.is_empty() {
+        return extracted;
+    }
+
     let clean = strip_ansi(output);
+    let tail: Vec<String> = clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| truncate(line, 200))
+        .collect();
+
+    if tail.is_empty() {
+        return format!("[FAIL] uv run failed (exit code: {exit_code})");
+    }
+
+    let summary = tail
+        .into_iter()
+        .rev()
+        .take(MAX_FALLBACK_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+
+    format!(
+        "[FAIL] uv run failed (exit code: {exit_code})\n{}",
+        summary.join("\n")
+    )
+}
+
+fn extract_diagnostics(text: &str) -> String {
+    let clean = strip_ansi(text);
     let lines: Vec<&str> = clean.lines().collect();
     let mut selected: Vec<String> = Vec::new();
     let mut i = 0;
@@ -106,39 +156,49 @@ fn filter_uv_run_output(output: &str, exit_code: i32) -> String {
         i += 1;
     }
 
-    let filtered = selected.join("\n").trim().to_string();
-    if !filtered.is_empty() {
-        return filtered;
+    selected.join("\n").trim().to_string()
+}
+
+fn filter_successful_run(stdout: &str, stderr: &str) -> String {
+    let payload = program_output(stdout);
+    let diagnostics = extract_diagnostics(stderr);
+
+    match (payload.is_empty(), diagnostics.is_empty()) {
+        (true, true) => "ok".to_string(),
+        (false, true) => payload,
+        (true, false) => diagnostics,
+        (false, false) => format!("{payload}\n{diagnostics}"),
+    }
+}
+
+fn program_output(stdout: &str) -> String {
+    let clean = strip_ansi(stdout);
+    let lines: Vec<&str> = clean.lines().collect();
+    let last_content = lines.iter().rposition(|line| !line.trim().is_empty());
+
+    let Some(last_content) = last_content else {
+        return String::new();
+    };
+    let lines = &lines[..=last_content];
+
+    if lines.len() <= MAX_PROGRAM_OUTPUT_LINES {
+        return lines.join("\n");
     }
 
-    if exit_code == 0 {
-        return "ok".to_string();
+    let shown = &lines[..MAX_PROGRAM_OUTPUT_LINES];
+    let hidden = lines.len() - MAX_PROGRAM_OUTPUT_LINES;
+    let mut out = shown.join("\n");
+    out.push_str(&format!("\n... +{hidden} more lines"));
+
+    if let Some(hint) = crate::core::tee::force_tee_tail_hint(
+        &clean,
+        "uv-run",
+        MAX_PROGRAM_OUTPUT_LINES + 1,
+    ) {
+        out.push_str(&format!("\n{hint}"));
     }
 
-    let tail: Vec<String> = clean
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| truncate(line, 200))
-        .collect();
-
-    if tail.is_empty() {
-        return format!("[FAIL] uv run failed (exit code: {exit_code})");
-    }
-
-    let summary = tail
-        .into_iter()
-        .rev()
-        .take(MAX_FALLBACK_TAIL_LINES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-
-    format!(
-        "[FAIL] uv run failed (exit code: {exit_code})\n{}",
-        summary.join("\n")
-    )
+    out
 }
 
 fn collect_traceback_block(lines: &[&str], start_idx: usize) -> (Vec<String>, usize) {
@@ -274,15 +334,52 @@ mod tests {
     use crate::core::utils::count_tokens;
 
     #[test]
-    fn test_filter_uv_run_suppresses_success_noise() {
-        let output = r#"
+    fn test_filter_uv_run_suppresses_uv_noise_but_keeps_program_output() {
+        let stderr = r#"
 Using CPython 3.12.2
 Resolved 12 packages in 48ms
 Installed 1 package in 5ms
-hello from script
 "#;
+        let stdout = "hello from script\n";
+        let raw = format!("{stderr}{stdout}");
 
-        assert_eq!(filter_uv_run_output(output, 0), "ok");
+        assert_eq!(
+            filter_uv_run_output(&raw, stdout, stderr, 0),
+            "hello from script"
+        );
+    }
+
+    #[test]
+    fn test_filter_uv_run_keeps_data_producing_stdout() {
+        let stdout = "{\n  \"users\": 42,\n  \"active\": 37\n}\n";
+        let stderr = "Resolved 12 packages in 48ms\n";
+        let raw = format!("{stderr}{stdout}");
+
+        let result = filter_uv_run_output(&raw, stdout, stderr, 0);
+
+        assert!(result.contains("\"users\": 42"));
+        assert!(result.contains("\"active\": 37"));
+        assert!(!result.contains("Resolved 12 packages"));
+    }
+
+    #[test]
+    fn test_filter_uv_run_silent_success_is_ok() {
+        let stderr = "Resolved 12 packages in 48ms\n";
+
+        assert_eq!(filter_uv_run_output(stderr, "", stderr, 0), "ok");
+    }
+
+    #[test]
+    fn test_filter_uv_run_success_keeps_stderr_warnings_with_payload() {
+        let stdout = "result: 7\n";
+        let stderr = "Resolved 12 packages in 48ms\nWARNING: deprecated api\n";
+        let raw = format!("{stderr}{stdout}");
+
+        let result = filter_uv_run_output(&raw, stdout, stderr, 0);
+
+        assert!(result.contains("result: 7"));
+        assert!(result.contains("WARNING: deprecated api"));
+        assert!(!result.contains("Resolved 12 packages"));
     }
 
     #[test]
@@ -300,7 +397,7 @@ Traceback (most recent call last):
 RuntimeError: kaboom
 "#;
 
-        let result = filter_uv_run_output(output, 1);
+        let result = filter_uv_run_output(output, "", "", 1);
         assert!(result.contains("Traceback (most recent call last):"));
         assert!(result.contains(r#"File "/tmp/project/main.py", line 10, in <module>"#));
         assert!(result.contains("RuntimeError: kaboom"));
@@ -318,7 +415,7 @@ RuntimeError: kaboom
         }
         output.push_str("RuntimeError: kaboom\n");
 
-        let result = filter_uv_run_output(&output, 1);
+        let result = filter_uv_run_output(&output, "", "", 1);
         assert!(result.contains("Traceback (most recent call last):"));
         assert!(result.contains("... +2 more frames"));
     }
@@ -332,7 +429,7 @@ FAILED tests/test_api.py::test_healthcheck - AssertionError: expected 200
 1 failed, 12 passed in 0.31s
 "#;
 
-        let result = filter_uv_run_output(output, 1);
+        let result = filter_uv_run_output(output, "", "", 1);
         assert!(result.contains("FAILED tests/test_api.py::test_healthcheck"));
         assert!(result.contains("1 failed, 12 passed in 0.31s"));
         assert!(!result.contains("Resolved 8 packages"));
@@ -341,7 +438,7 @@ FAILED tests/test_api.py::test_healthcheck - AssertionError: expected 200
     #[test]
     fn test_filter_uv_run_has_failure_fallback() {
         let output = "sync aborted by signal";
-        let result = filter_uv_run_output(output, 2);
+        let result = filter_uv_run_output(output, "", "", 2);
 
         assert!(result.contains("[FAIL] uv run failed (exit code: 2)"));
         assert!(result.contains("sync aborted by signal"));
@@ -350,7 +447,7 @@ FAILED tests/test_api.py::test_healthcheck - AssertionError: expected 200
     #[test]
     fn test_filter_uv_run_pytest_fixture_token_savings() {
         let input = include_str!("../../../tests/fixtures/uv_run_pytest_failure.txt");
-        let output = filter_uv_run_output(input, 1);
+        let output = filter_uv_run_output(input, "", "", 1);
         let input_tokens = count_tokens(input);
         let output_tokens = count_tokens(&output);
         let savings = 100.0 - (output_tokens as f64 / input_tokens as f64 * 100.0);
